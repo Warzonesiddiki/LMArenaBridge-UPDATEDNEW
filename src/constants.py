@@ -7,8 +7,27 @@ All hardcoded values should be defined here.
 # APPLICATION CONFIGURATION
 # ============================================================
 
-# Set to True for detailed logging, False for minimal logging
-DEBUG = True
+import os
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment override without treating unset as false."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+# Detailed logging remains enabled by default for local troubleshooting, but
+# operators can disable it with LMAB_DEBUG=0 (recommended when exposed).
+DEBUG = _env_bool("LMAB_DEBUG", True)
+
+# Structured logging is opt-in: text preserves the historical console format,
+# while json emits one redacted JSON object per record.
+LOG_FORMAT = os.getenv("LMAB_LOG_FORMAT", "text").strip().lower()
+if LOG_FORMAT not in {"text", "json"}:
+    LOG_FORMAT = "text"
+LOG_LEVEL = os.getenv("LMAB_LOG_LEVEL", "").strip().upper()
 
 # Port to run the server on
 PORT = 8000
@@ -213,6 +232,11 @@ RECAPTCHA_V3_TOKEN_LIFETIME_SECONDS = 115
 
 # Background refresh interval (seconds)
 PERIODIC_REFRESH_INTERVAL_SECONDS = 1800  # 30 minutes
+
+# In-memory state bounds (oldest entries are evicted first)
+MAX_CHAT_SESSIONS_PER_KEY = 200
+MAX_MESSAGES_PER_SESSION = 200
+DASHBOARD_SESSION_TTL_SECONDS = 86400  # 24 hours
 
 # Rate limiting
 RATE_LIMIT_WINDOW_SECONDS = 60

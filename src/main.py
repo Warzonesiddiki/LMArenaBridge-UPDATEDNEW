@@ -9,8 +9,9 @@ import uuid
 import time
 import secrets
 import base64
-import mimetypes
 import hashlib
+import html
+import mimetypes
 from collections import defaultdict
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
@@ -20,12 +21,15 @@ from urllib.parse import urlsplit, urlparse, parse_qs
 
 import uvicorn
 from camoufox.async_api import AsyncCamoufox
-from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Header, status, Form, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 
 import httpx
+import logging
 import requests
 
 # Import from modularized modules
@@ -33,6 +37,7 @@ from . import constants
 from . import config as _config_module
 from . import state as _state_module
 from .config import get_models, save_models
+from .logging_utils import configure_logging, log_event, redact_text
 from .browser_utils import (
     _is_windows,
     _normalize_camoufox_window_mode,
@@ -99,6 +104,9 @@ from .transport import (
     fetch_lmarena_stream_via_userscript_proxy,
     fetch_lmarena_stream_via_chrome,
     fetch_lmarena_stream_via_camoufox,
+    browser_fetch_order,
+    resolve_browser_fetch_outer_timeout,
+    select_browser_fetch_auth_token,
     fetch_via_proxy_queue,
     push_proxy_chunk,
     camoufox_proxy_worker,
@@ -112,6 +120,9 @@ from .vision_solver import (
 
 # Aliases for backward compatibility
 DEBUG = constants.DEBUG
+LOG_FORMAT = constants.LOG_FORMAT
+LOG_LEVEL = constants.LOG_LEVEL
+_LOGGER = configure_logging()
 PORT = constants.PORT
 HTTPStatus = constants.HTTPStatus
 STATUS_MESSAGES = constants.STATUS_MESSAGES
@@ -131,6 +142,9 @@ TOKEN_EXPIRY_SKEW_SECONDS = constants.TOKEN_EXPIRY_SKEW_SECONDS
 RECAPTCHA_TOKEN_EXPIRY_SECONDS = constants.RECAPTCHA_TOKEN_EXPIRY_SECONDS
 RECAPTCHA_V3_TOKEN_LIFETIME_SECONDS = constants.RECAPTCHA_V3_TOKEN_LIFETIME_SECONDS
 PERIODIC_REFRESH_INTERVAL_SECONDS = constants.PERIODIC_REFRESH_INTERVAL_SECONDS
+MAX_CHAT_SESSIONS_PER_KEY = constants.MAX_CHAT_SESSIONS_PER_KEY
+MAX_MESSAGES_PER_SESSION = constants.MAX_MESSAGES_PER_SESSION
+DASHBOARD_SESSION_TTL_SECONDS = constants.DASHBOARD_SESSION_TTL_SECONDS
 DEFAULT_RATE_LIMIT_RPM = constants.DEFAULT_RATE_LIMIT_RPM
 RATE_LIMIT_WINDOW_SECONDS = constants.RATE_LIMIT_WINDOW_SECONDS
 DEFAULT_USERSCRIPT_PROXY_POLL_TIMEOUT_SECONDS = constants.DEFAULT_USERSCRIPT_PROXY_POLL_TIMEOUT_SECONDS
@@ -204,10 +218,153 @@ def safe_print(*args, **kwargs) -> None:
 print = safe_print  # type: ignore[assignment]
 
 
-def debug_print(*args, **kwargs):
-    """Print debug messages only if DEBUG is True"""
-    if DEBUG:
-        print(*args, **kwargs)
+def _infer_log_level(message: str) -> int:
+    text = str(message).lstrip()
+    if text.startswith("❌"):
+        return logging.ERROR
+    if text.startswith("⚠️") or text.startswith("⚠"):
+        return logging.WARNING
+    if text.startswith("✅"):
+        return logging.INFO
+    return logging.DEBUG
+
+
+def debug_print(*args, event: Optional[str] = None, level=None, fields: Optional[dict] = None, **kwargs):
+    """Emit a legacy debug message through the configured structured logger."""
+    if not DEBUG:
+        return
+    if "file" in kwargs:
+        safe_args = [redact_text(arg) if isinstance(arg, str) else arg for arg in args]
+        print(*safe_args, **kwargs)
+        return
+
+    sep = str(kwargs.get("sep", " "))
+    message = sep.join(str(arg) for arg in args)
+    if isinstance(level, str):
+        parsed_level = logging.getLevelName(level.strip().upper())
+        selected_level = parsed_level if isinstance(parsed_level, int) else _infer_log_level(message)
+    elif isinstance(level, int):
+        selected_level = level
+    else:
+        selected_level = _infer_log_level(message)
+
+    if event or fields:
+        log_event(_LOGGER, selected_level, event or "debug", message, **(fields or {}))
+    else:
+        _LOGGER.log(selected_level, redact_text(message))
+
+
+def _secret_fingerprint(value: object) -> str:
+    """Return a correlation-safe fingerprint that never reveals a secret value."""
+    if value is None:
+        return "<empty>"
+    text = str(value)
+    if not text:
+        return "<empty>"
+    digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    return f"<redacted sha256:{digest} len={len(text)}>"
+
+
+def _payload_log_summary(payload: object) -> dict:
+    """Summarize an upstream payload for logs without prompt or token content."""
+    if not isinstance(payload, dict):
+        return {"payload_type": type(payload).__name__}
+
+    user_message = payload.get("userMessage")
+    if not isinstance(user_message, dict):
+        user_message = {}
+    attachments = user_message.get("experimental_attachments")
+    content = user_message.get("content", "")
+
+    return {
+        "session_id": _secret_fingerprint(payload.get("id")),
+        "mode": payload.get("mode"),
+        "model_id": payload.get("modelAId"),
+        "modality": payload.get("modality"),
+        "content_chars": len(str(content)),
+        "attachments": len(attachments) if isinstance(attachments, list) else 0,
+        "has_recaptcha_v3": bool(payload.get("recaptchaV3Token")),
+        "has_recaptcha_v2": bool(payload.get("recaptchaV2Token")),
+    }
+
+
+def _estimate_tokens(value: object) -> int:
+    """Estimate tokens at roughly four characters per token.
+
+    Arena's internal stream does not provide authoritative token accounting.
+    This explicitly approximate calculation is preferable to reporting raw
+    character counts as token counts.
+    """
+    if value is None:
+        return 0
+    text = value if isinstance(value, str) else str(value)
+    if not text:
+        return 0
+    return (len(text) + 3) // 4
+
+
+def _error_message(detail: object) -> str:
+    if isinstance(detail, str):
+        return detail
+    try:
+        return json.dumps(detail, ensure_ascii=False, default=str)
+    except Exception:
+        return str(detail)
+
+
+def _openai_error_type(status_code: int) -> str:
+    return {
+        400: "invalid_request_error",
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        405: "invalid_request_error",
+        409: "invalid_request_error",
+        422: "invalid_request_error",
+        429: "rate_limit_error",
+    }.get(int(status_code), "server_error" if int(status_code) >= 500 else "invalid_request_error")
+
+
+def _anthropic_error_type(status_code: int) -> str:
+    return {
+        400: "invalid_request_error",
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        413: "request_too_large",
+        422: "invalid_request_error",
+        429: "rate_limit_error",
+        503: "overloaded_error",
+        529: "overloaded_error",
+    }.get(int(status_code), "api_error" if int(status_code) >= 500 else "invalid_request_error")
+
+
+def _api_error_response(
+    request: Request,
+    status_code: int,
+    detail: object,
+    headers: Optional[Dict[str, str]] = None,
+) -> JSONResponse:
+    """Return the error envelope expected by the selected API surface."""
+    message = _error_message(detail)
+    if request.url.path == "/api/v1/messages":
+        content = {
+            "type": "error",
+            "error": {
+                "type": _anthropic_error_type(status_code),
+                "message": message,
+            },
+        }
+    else:
+        content = {
+            "error": {
+                "message": message,
+                "type": _openai_error_type(status_code),
+                "param": None,
+                "code": str(status_code),
+            }
+        }
+    return JSONResponse(content=content, status_code=int(status_code), headers=headers)
 
 
 def get_status_emoji(status_code: int) -> str:
@@ -617,7 +774,10 @@ async def lifespan(app: FastAPI):
         await startup_event()
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
-    yield
+    try:
+        yield
+    finally:
+        await _cancel_background_tasks()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -630,6 +790,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    if request.url.path.startswith("/api/v1/"):
+        return _api_error_response(request, exc.status_code, exc.detail, exc.headers)
+    return JSONResponse(
+        content={"detail": exc.detail},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/v1/"):
+        parts: List[str] = []
+        for error in exc.errors():
+            location = ".".join(
+                str(part) for part in error.get("loc", ()) if str(part) not in {"body", "query", "path"}
+            )
+            message = str(error.get("msg") or "Invalid value")
+            parts.append(f"{location}: {message}" if location else message)
+        # Anthropic uses 400 for malformed message requests instead of FastAPI's 422.
+        status_code = 400 if request.url.path == "/api/v1/messages" else 422
+        return _api_error_response(request, status_code, "; ".join(parts) or "Invalid request")
+    return JSONResponse(content={"detail": jsonable_encoder(exc.errors())}, status_code=422)
+
 # --- Constants & Global State ---
 CONFIG_FILE = constants.CONFIG_FILE
 MODELS_FILE = constants.MODELS_FILE
@@ -639,7 +826,9 @@ API_KEY_HEADER = APIKeyHeader(name="Authorization", auto_error=False)
 # { "api_key": { "conversation_id": session_data } }
 chat_sessions: Dict[str, Dict[str, dict]] = defaultdict(dict)
 # { "session_id": "username" }
-dashboard_sessions = {}
+dashboard_sessions: Dict[str, str] = {}
+# { "session_id": created_at_epoch } for bounded dashboard-session expiry.
+_dashboard_session_created_at: Dict[str, float] = {}
 # { "api_key": [timestamp1, timestamp2, ...] }
 api_key_usage = defaultdict(list)
 # { "model_id": count }
@@ -652,6 +841,8 @@ _LAST_CONFIG_FILE: Optional[str] = None
 conversation_tokens: Dict[str, str] = {}
 # Track failed tokens per request to avoid retrying with same token
 request_failed_tokens: Dict[str, set] = {}
+# Long-lived tasks owned by startup; cancelled during lifespan shutdown.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 # Ephemeral Arena auth cookie captured from browser sessions (not persisted unless enabled).
 EPHEMERAL_ARENA_AUTH_TOKEN: Optional[str] = None
@@ -666,6 +857,108 @@ RECAPTCHA_EXPIRY: datetime = datetime.now(timezone.utc) - timedelta(days=365)
 # --------------------------------------
 
 # --- Helper Functions ---
+
+def _track_background_task(task: asyncio.Task) -> asyncio.Task:
+    """Register a startup-owned task so lifespan shutdown can cancel it."""
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
+async def _cancel_background_tasks() -> int:
+    """Cancel all startup-owned tasks and return how many were tracked."""
+    tasks = list(_BACKGROUND_TASKS)
+    for task in tasks:
+        await _cancel_background_task(task)
+    for task in tasks:
+        _BACKGROUND_TASKS.discard(task)
+    return len(tasks)
+
+
+def _conversation_id_for(
+    api_key: object,
+    model_name: object,
+    first_user_message: object,
+    system_prompt: object = "",
+) -> str:
+    """Derive a collision-resistant local conversation ID from full context."""
+    material = "".join(
+        str(value or "")
+        for value in (api_key, model_name, first_user_message, system_prompt)
+    )
+    return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _bounded_session_put(
+    api_key: object,
+    conversation_id: str,
+    session_data: Optional[dict] = None,
+    *,
+    append_messages: Optional[List[dict]] = None,
+) -> Optional[dict]:
+    """Store/append a chat session while enforcing per-key/message bounds."""
+    try:
+        max_sessions = max(1, int(MAX_CHAT_SESSIONS_PER_KEY))
+    except Exception:
+        max_sessions = 200
+    try:
+        max_messages = max(1, int(MAX_MESSAGES_PER_SESSION))
+    except Exception:
+        max_messages = 200
+
+    per_key = chat_sessions.setdefault(str(api_key), {})
+    if session_data is not None:
+        per_key[str(conversation_id)] = session_data
+
+    stored = per_key.get(str(conversation_id))
+    if not isinstance(stored, dict):
+        return None
+
+    messages = stored.setdefault("messages", [])
+    if append_messages:
+        if not isinstance(messages, list):
+            messages = []
+            stored["messages"] = messages
+        messages.extend(append_messages)
+    if isinstance(messages, list) and len(messages) > max_messages:
+        del messages[:-max_messages]
+
+    # Refresh recency before FIFO eviction.
+    per_key[str(conversation_id)] = per_key.pop(str(conversation_id))
+    while len(per_key) > max_sessions:
+        oldest_id = next(iter(per_key))
+        if oldest_id == str(conversation_id):
+            break
+        evicted = per_key.pop(oldest_id, None)
+        conversation_tokens.pop(oldest_id, None)
+        if isinstance(evicted, dict):
+            conversation_tokens.pop(str(evicted.get("conversation_id") or ""), None)
+    return stored
+
+
+def _prune_dashboard_sessions(now: Optional[float] = None) -> int:
+    """Remove dashboard sessions older than the configured TTL."""
+    current = time.time() if now is None else float(now)
+    try:
+        ttl = max(1, int(DASHBOARD_SESSION_TTL_SECONDS))
+    except Exception:
+        ttl = 86400
+
+    expired: List[str] = []
+    for session_id, created_at in list(_dashboard_session_created_at.items()):
+        try:
+            created = float(created_at)
+        except Exception:
+            expired.append(session_id)
+            continue
+        if current - created > ttl:
+            expired.append(session_id)
+
+    for session_id in expired:
+        dashboard_sessions.pop(session_id, None)
+        _dashboard_session_created_at.pop(session_id, None)
+    return len(expired)
+
 
 def get_config():
     global current_token_index, _LAST_CONFIG_FILE
@@ -682,6 +975,10 @@ def get_config():
         config = {}
     except Exception as e:
         debug_print(f"⚠️  Unexpected error reading config: {e}, using defaults")
+        config = {}
+
+    if not isinstance(config, dict):
+        debug_print("⚠️  Config top level was not a JSON object, using defaults")
         config = {}
 
     # Ensure default keys exist
@@ -722,6 +1019,7 @@ def save_config(config, *, preserve_auth_tokens: bool = True):
 
         # Persist in-memory stats to the config dict before saving
         config["usage_stats"] = dict(model_usage_stats)
+        _config_module._apply_config_defaults(config)
         tmp_path = f"{CONFIG_FILE}.tmp"
         with open(tmp_path, "w") as f:
             json.dump(config, f, indent=4)
@@ -754,6 +1052,7 @@ def get_request_headers():
 # --- Dashboard Authentication ---
 
 async def get_current_session(request: Request):
+    _prune_dashboard_sessions()
     session_id = request.cookies.get("session_id")
     if session_id and session_id in dashboard_sessions:
         return dashboard_sessions[session_id]
@@ -761,23 +1060,45 @@ async def get_current_session(request: Request):
 
 # --- API Key Authentication & Rate Limiting ---
 
-async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
+async def rate_limit_api_key(
+    key: Optional[str] = Depends(API_KEY_HEADER),
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+):
     config = get_config()
     api_keys = config.get("api_keys", [])
+    if not isinstance(api_keys, list):
+        api_keys = []
 
     api_key_str = None
-    if key and key.startswith("Bearer "):
-        api_key_str = key[7:].strip()
+    if key:
+        supplied = str(key).strip()
+        if supplied.lower().startswith("bearer "):
+            api_key_str = supplied[7:].strip() or None
+        elif supplied:
+            # Accept the raw key in Authorization for clients that do not add
+            # the Bearer scheme; it must still match a configured key exactly.
+            api_key_str = supplied
+    if not api_key_str and x_api_key:
+        api_key_str = str(x_api_key).strip() or None
 
-    # If no API keys configured, allow anonymous access (optional auth)
+    # Before initial dashboard setup there may be no keys at all. Startup
+    # normally creates one, so this anonymous state should be transient.
     if not api_keys:
         return {"key": "anonymous", "name": "Anonymous", "rpm": 9999}
 
-    # If keys are configured but none provided, use first available key
     if not api_key_str:
-        api_key_str = api_keys[0]["key"]
+        if bool(config.get("allow_missing_api_key")):
+            # Explicit legacy compatibility for clients such as an OpenWebUI
+            # connection intentionally configured with an empty API key.
+            api_key_str = str(api_keys[0].get("key") or "") or None
+        if not api_key_str:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing API Key.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
-    key_data = next((k for k in api_keys if k["key"] == api_key_str), None)
+    key_data = next((k for k in api_keys if isinstance(k, dict) and k.get("key") == api_key_str), None)
     if not key_data:
         raise HTTPException(status_code=401, detail="Invalid API Key.")
 
@@ -915,7 +1236,7 @@ async def get_initial_data():
                 save_config(config)
 
             if str(config.get("cf_clearance") or "").strip():
-                debug_print(f"✅ Saved cf_clearance token: {str(config.get('cf_clearance'))[:20]}...")
+                debug_print(f"✅ Saved cf_clearance token: {_secret_fingerprint(config.get('cf_clearance'))}")
             else:
                 debug_print("⚠️ Could not find cf_clearance cookie.")
 
@@ -1102,7 +1423,7 @@ async def startup_event():
         # requests can refresh on-demand. Avoid launching extra browser instances at startup.
 
         # 3. Start background tasks
-        asyncio.create_task(periodic_refresh_task())
+        _track_background_task(asyncio.create_task(periodic_refresh_task()))
         
         # Mark userscript proxy as active at startup to allow immediate delegation
         # to the internal Camoufox proxy worker.
@@ -1111,7 +1432,7 @@ async def startup_event():
         last_userscript_poll = now
         USERSCRIPT_PROXY_LAST_POLL_AT = now
         
-        asyncio.create_task(camoufox_proxy_worker())
+        _track_background_task(asyncio.create_task(camoufox_proxy_worker()))
         
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
@@ -1257,10 +1578,17 @@ async def login_page(request: Request, error: Optional[str] = None):
 async def login_submit(response: Response, password: str = Form(...)):
     config = get_config()
     if password == config.get("password"):
+        _prune_dashboard_sessions()
         session_id = str(uuid.uuid4())
         dashboard_sessions[session_id] = "admin"
+        _dashboard_session_created_at[session_id] = time.time()
         response = RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-        response.set_cookie(key="session_id", value=session_id, httponly=True)
+        response.set_cookie(
+            key="session_id",
+            value=session_id,
+            httponly=True,
+            max_age=int(DASHBOARD_SESSION_TTL_SECONDS),
+        )
         return response
     return RedirectResponse(url="/login?error=1", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -1269,6 +1597,7 @@ async def logout(request: Request, response: Response):
     session_id = request.cookies.get("session_id")
     if session_id in dashboard_sessions:
         del dashboard_sessions[session_id]
+    _dashboard_session_created_at.pop(session_id, None)
     response = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
     response.delete_cookie("session_id")
     return response
@@ -1287,7 +1616,7 @@ async def dashboard(session: str = Depends(get_current_session)):
         return HTMLResponse(f"""
             <html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
                 <h1>⚠️ Dashboard Error</h1>
-                <p>Failed to load configuration: {str(e)}</p>
+                <p>Failed to load configuration: {html.escape(str(e))}</p>
                 <p><a href="/logout">Logout</a> | <a href="/dashboard">Retry</a></p>
             </body></html>
         """, status_code=500)
@@ -1295,9 +1624,9 @@ async def dashboard(session: str = Depends(get_current_session)):
     # Render API Keys
     keys_html = ""
     for key in config["api_keys"]:
-        key_name = key.get("name") or "Unnamed Key"
-        key_value = key.get("key") or ""
-        rpm_value = key.get("rpm", 60)
+        key_name = html.escape(str(key.get("name") or "Unnamed Key"))
+        key_value = html.escape(str(key.get("key") or ""), quote=True)
+        rpm_value = html.escape(str(key.get("rpm", 60)))
         created_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(key.get('created', 0)))
         keys_html += f"""
             <tr>
@@ -1318,12 +1647,13 @@ async def dashboard(session: str = Depends(get_current_session)):
     text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
     models_html = ""
     for i, model in enumerate(text_models[:20]):
-        rank = model.get('rank', '?')
-        org = model.get('organization', 'Unknown')
+        rank = html.escape(str(model.get('rank', '?')))
+        org = html.escape(str(model.get('organization', 'Unknown')))
+        model_name = html.escape(str(model.get('publicName', 'Unnamed')))
         models_html += f"""
             <div class="model-card">
                 <div class="model-header">
-                    <span class="model-name">{model.get('publicName', 'Unnamed')}</span>
+                    <span class="model-name">{model_name}</span>
                     <span class="model-rank">Rank {rank}</span>
                 </div>
                 <div class="model-org">{org}</div>
@@ -1337,7 +1667,7 @@ async def dashboard(session: str = Depends(get_current_session)):
     stats_html = ""
     if model_usage_stats:
         for model, count in sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
-            stats_html += f"<tr><td>{model}</td><td><strong>{count}</strong></td></tr>"
+            stats_html += f"<tr><td>{html.escape(str(model))}</td><td><strong>{html.escape(str(count))}</strong></td></tr>"
     else:
         stats_html = "<tr><td colspan='2' class='no-data'>No usage data yet</td></tr>"
 
@@ -1670,7 +2000,7 @@ async def dashboard(session: str = Depends(get_current_session)):
                     
                     {''.join([f'''
                     <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding: 10px; background: #f8f9fa; border-radius: 6px;">
-                        <code style="flex: 1; font-family: 'Courier New', monospace; font-size: 12px; word-break: break-all;">{token[:50]}...</code>
+                        <code style="flex: 1; font-family: 'Courier New', monospace; font-size: 12px; word-break: break-all;">{_secret_fingerprint(token)}</code>
                         <form action="/delete-auth-token" method="post" style="margin: 0;" onsubmit="return confirm('Delete this token?');">
                             <input type="hidden" name="token_index" value="{i}">
                             <button type="submit" class="btn-delete">Delete</button>
@@ -1698,7 +2028,7 @@ async def dashboard(session: str = Depends(get_current_session)):
                     </div>
                     <p style="color: #666; margin-bottom: 15px;">This is automatically fetched on startup. If API requests fail with 404 errors, the token may have expired.</p>
                     <code style="background: #f8f9fa; padding: 10px; display: block; border-radius: 6px; word-break: break-all; margin-bottom: 15px;">
-                        {config.get("cf_clearance", "Not set")}
+                        {html.escape(_secret_fingerprint(config.get("cf_clearance")) if config.get("cf_clearance") else "Not set")}
                     </code>
                     <form action="/refresh-tokens" method="post" style="margin-top: 15px;">
                         <button type="submit" style="background: #28a745;">🔄 Refresh Tokens &amp; Models</button>
@@ -2148,34 +2478,51 @@ async def userscript_push(request: Request):
 
 @app.get("/api/v1/health")
 async def health_check():
-    """Health check endpoint for monitoring"""
+    """Readiness check: HTTP 200 only when the bridge can plausibly serve chat."""
     try:
         models = get_models()
+        if not isinstance(models, list):
+            models = []
         config = get_config()
-        
-        # Basic health checks
-        has_cf_clearance = bool(config.get("cf_clearance"))
+
+        auth_tokens = config.get("auth_tokens", [])
+        has_configured_tokens = isinstance(auth_tokens, list) and any(
+            str(token or "").strip() for token in auth_tokens
+        )
+        has_legacy_token = bool(str(config.get("auth_token") or "").strip())
+        cookie_store = config.get("browser_cookies")
+        has_browser_cookie = isinstance(cookie_store, dict) and bool(
+            str(cookie_store.get("arena-auth-prod-v1") or "").strip()
+        )
+        has_auth_tokens = has_configured_tokens or has_legacy_token or has_browser_cookie
+
+        api_keys = config.get("api_keys", [])
+        has_cf_clearance = bool(str(config.get("cf_clearance") or "").strip())
         has_models = len(models) > 0
-        has_api_keys = len(config.get("api_keys", [])) > 0
-        
-        status = "healthy" if (has_cf_clearance and has_models) else "degraded"
-        
-        return {
-            "status": status,
+        has_api_keys = isinstance(api_keys, list) and len(api_keys) > 0
+
+        healthy = has_cf_clearance and has_models and has_auth_tokens
+        body = {
+            "status": "healthy" if healthy else "degraded",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "checks": {
                 "cf_clearance": has_cf_clearance,
                 "models_loaded": has_models,
                 "model_count": len(models),
-                "api_keys_configured": has_api_keys
-            }
+                "api_keys_configured": has_api_keys,
+                "auth_tokens_configured": has_auth_tokens,
+            },
         }
+        return JSONResponse(content=body, status_code=200 if healthy else 503)
     except Exception as e:
-        return {
-            "status": "unhealthy",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "error": str(e)
-        }
+        return JSONResponse(
+            content={
+                "status": "unhealthy",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": str(e),
+            },
+            status_code=503,
+        )
 
 # --- Ollama-compatible stubs (OpenWebUI probes these endpoints) ---
 
@@ -2359,7 +2706,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         system_messages = [m for m in messages if m.get("role") == "system"]
         if system_messages:
             system_prompt = "\n\n".join([_coerce_message_content_to_text(m.get("content", "")) for m in system_messages])
-            debug_print(f"📋 System prompt found: {system_prompt[:100]}..." if len(system_prompt) > 100 else f"📋 System prompt: {system_prompt}")
+            debug_print(f"📋 System prompt provided ({len(system_prompt)} chars; content redacted)")
         
         # Process last message content (may include images)
         try:
@@ -2438,21 +2785,24 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         status_code=503,
                         detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked."
                     )
-                debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
+                debug_print(f"🔑 Using reCAPTCHA v3 token: {_secret_fingerprint(recaptcha_token)}")
         # -----------------------------------------------
         
-        # Generate conversation ID from context (API key + model + first user message)
-        import hashlib
+        # Generate a local conversation ID from the complete initial context.
         first_user_message = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
         if isinstance(first_user_message, list):
             # Handle array content format
             first_user_message = str(first_user_message)
-        conversation_key = f"{api_key_str}_{model_public_name}_{first_user_message[:100]}"
-        conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
+        conversation_id = _conversation_id_for(
+            api_key_str,
+            model_public_name,
+            first_user_message,
+            system_prompt,
+        )
         
-        debug_print(f"🔑 API Key: {api_key_str[:20]}...")
+        debug_print(f"🔑 API Key: {_secret_fingerprint(api_key_str)}")
         debug_print(f"💭 Auto-generated Conversation ID: {conversation_id}")
-        debug_print(f"🔑 Conversation key: {conversation_key[:100]}...")
+        debug_print("🔑 Conversation key material redacted; full-context hash used")
 
         # Headers are prepared after selecting an auth token (or when falling back to browser-only transports).
         headers: dict[str, str] = {}
@@ -2518,7 +2868,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             url = f"https://arena.ai{STREAM_CREATE_EVALUATION_PATH}"
             debug_print(f"📤 Target URL: {url}")
             debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
+            debug_print(f"🔍 Payload summary: {json.dumps(_payload_log_summary(payload), indent=2)}")
             http_method = "POST"
         else:
             debug_print("🔄 Using EXISTING conversation session")
@@ -2547,7 +2897,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             url = f"https://arena.ai/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
             debug_print(f"📤 Target URL: {url}")
             debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
+            debug_print(f"🔍 Payload summary: {json.dumps(_payload_log_summary(payload), indent=2)}")
             http_method = "POST"
 
         debug_print(f"\n🚀 Making API request to LMArena...")
@@ -2603,7 +2953,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 current_token = refreshed
         headers = get_request_headers_with_token(current_token, recaptcha_token)
         if current_token:
-            debug_print(f"🔑 Using token (round-robin): {current_token[:20]}...")
+            debug_print(f"🔑 Using token (round-robin): {_secret_fingerprint(current_token)}")
         else:
             debug_print("🔑 No auth token configured (will rely on browser session cookies).")
         
@@ -2624,7 +2974,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     log_http_status(response.status_code, "LMArena API")
 
                     if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                        debug_print(f"⏱️  Attempt {attempt + 1}/{max_retries} - Rate limit with token {current_token[:20]}...")
+                        debug_print(f"⏱️  Attempt {attempt + 1}/{max_retries} - Rate limit with token {_secret_fingerprint(current_token)}")
                         retry_after = response.headers.get("Retry-After")
                         sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
                         debug_print(f"  Retry-After header: {retry_after!r}")
@@ -2633,7 +2983,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             try:
                                 current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                 headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
+                                debug_print(f"🔄 Retrying with next token: {_secret_fingerprint(current_token)}")
                                 await asyncio.sleep(sleep_seconds)
                                 continue
                             except HTTPException as e:
@@ -2659,7 +3009,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 continue
 
                     elif response.status_code == HTTPStatus.UNAUTHORIZED:
-                        debug_print(f"🔒 Attempt {attempt + 1}/{max_retries} - Auth failed with token {current_token[:20]}...")
+                        debug_print(f"🔒 Attempt {attempt + 1}/{max_retries} - Auth failed with token {_secret_fingerprint(current_token)}")
                         failed_tokens.add(current_token)
                         debug_print(f"📝 Failed tokens so far: {len(failed_tokens)}")
 
@@ -2667,7 +3017,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             try:
                                 current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                 headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
+                                debug_print(f"🔄 Retrying with next token: {_secret_fingerprint(current_token)}")
                                 await asyncio.sleep(1)
                                 continue
                             except HTTPException as e:
@@ -2919,37 +3269,28 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     if cached_token:
                                         payload["recaptchaV3Token"] = cached_token
 
-                                async def _try_chrome_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🌐 Using Chrome fetch transport for streaming...")
+                                async def _try_browser_fetch(spec) -> Optional[BrowserFetchStreamResponse]:
+                                    debug_print(f"{spec.emoji} Using {spec.label} fetch transport for streaming...")
                                     try:
-                                        auth_for_browser = str(current_token or "").strip()
                                         try:
-                                            cand = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
+                                            ephemeral_token = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
                                         except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            chrome_outer_timeout = float(get_config().get("chrome_fetch_outer_timeout_seconds", 120))
-                                        except Exception:
-                                            chrome_outer_timeout = 120.0
-                                        chrome_outer_timeout = max(20.0, min(chrome_outer_timeout, 300.0))
-
+                                            ephemeral_token = ""
+                                        auth_for_browser = select_browser_fetch_auth_token(
+                                            current_token,
+                                            ephemeral_token,
+                                        )
+                                        outer_timeout = resolve_browser_fetch_outer_timeout(
+                                            get_config(),
+                                            spec,
+                                        )
+                                        fetcher = (
+                                            fetch_lmarena_stream_via_chrome
+                                            if spec.name == "chrome"
+                                            else fetch_lmarena_stream_via_camoufox
+                                        )
                                         return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_chrome(
+                                            fetcher(
                                                 http_method=http_method,
                                                 url=url,
                                                 payload=payload if isinstance(payload, dict) else {},
@@ -2957,116 +3298,31 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                                 timeout_seconds=120,
                                                 max_recaptcha_attempts=browser_fetch_attempts,
                                             ),
-                                            timeout=chrome_outer_timeout,
+                                            timeout=outer_timeout,
                                         )
                                     except asyncio.TimeoutError:
-                                        debug_print("⚠️ Chrome fetch transport timed out (launch/nav hang).")
+                                        debug_print(f"⚠️ {spec.label} fetch transport timed out (launch/nav hang).")
                                         return None
                                     except Exception as e:
-                                        debug_print(f"⚠️ Chrome fetch transport error: {e}")
+                                        debug_print(f"⚠️ {spec.label} fetch transport error: {e}")
                                         return None
 
-                                async def _try_camoufox_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🦊 Using Camoufox fetch transport for streaming...")
-                                    try:
-                                        auth_for_browser = str(current_token or "").strip()
-                                        try:
-                                            cand = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
-                                        except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            camoufox_outer_timeout = float(
-                                                get_config().get("camoufox_fetch_outer_timeout_seconds", 180)
-                                            )
-                                        except Exception:
-                                            camoufox_outer_timeout = 180.0
-                                        camoufox_outer_timeout = max(20.0, min(camoufox_outer_timeout, 300.0))
-
-                                        return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_camoufox(
-                                                http_method=http_method,
-                                                url=url,
-                                                payload=payload if isinstance(payload, dict) else {},
-                                                auth_token=auth_for_browser,
-                                                timeout_seconds=120,
-                                                max_recaptcha_attempts=browser_fetch_attempts,
-                                            ),
-                                            timeout=camoufox_outer_timeout,
-                                        )
-                                    except asyncio.TimeoutError:
-                                        debug_print("⚠️ Camoufox fetch transport timed out (launch/nav hang).")
-                                        return None
-                                    except Exception as e:
-                                        debug_print(f"⚠️ Camoufox fetch transport error: {e}")
-                                        return None
-
-                                if prefer_chrome_transport:
-                                    chrome_task = asyncio.create_task(_try_chrome_fetch())
+                                for spec in browser_fetch_order(
+                                    prefer_chrome=prefer_chrome_transport
+                                ):
+                                    fetch_task = asyncio.create_task(_try_browser_fetch(spec))
                                     while True:
-                                        done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                        if chrome_task in done:
+                                        done, _ = await asyncio.wait({fetch_task}, timeout=1.0)
+                                        if fetch_task in done:
                                             try:
-                                                stream_context = chrome_task.result()
+                                                stream_context = fetch_task.result()
                                             except Exception:
                                                 stream_context = None
                                             break
                                         yield ": keep-alive\n\n"
                                     if stream_context is not None:
-                                        transport_used = "chrome"
-                                    if stream_context is None:
-                                        camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                            if camoufox_task in done:
-                                                try:
-                                                    stream_context = camoufox_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "camoufox"
-                                else:
-                                    camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                        if camoufox_task in done:
-                                            try:
-                                                stream_context = camoufox_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield ": keep-alive\n\n"
-                                    if stream_context is not None:
-                                        transport_used = "camoufox"
-                                    if stream_context is None:
-                                        chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                            if chrome_task in done:
-                                                try:
-                                                    stream_context = chrome_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "chrome"
+                                        transport_used = spec.name
+                                        break
 
                             # Userscript proxy: backup transport after browser transports fail.
                             if stream_context is None and userscript_proxy_available and not disable_userscript_for_request:
@@ -3415,7 +3671,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                             )
                                             headers = get_request_headers_with_token(current_token, recaptcha_token)
                                             token_rotated = True
-                                            debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
+                                            debug_print(f"🔄 Retrying stream with next token: {_secret_fingerprint(current_token)}")
                                         except HTTPException:
                                             # Only one token (or all tokens excluded). Keep the current token and retry
                                             # after backoff instead of failing fast.
@@ -3691,7 +3947,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         # Try with next available token (excluding failed ones)
                                         current_token = get_next_auth_token(exclude_tokens=failed_tokens)
                                         headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                        debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
+                                        debug_print(f"🔄 Retrying stream with next token: {_secret_fingerprint(current_token)}")
                                         async for ka in wait_with_keepalive(1.0):
                                             yield ka
                                         continue
@@ -4067,7 +4323,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                         )
                                         headers = get_request_headers_with_token(current_token, recaptcha_token)
                                         token_rotated = True
-                                        debug_print(f"🔄 Retrying stream with next token (after proxy 429): {current_token[:20]}...")
+                                        debug_print(f"🔄 Retrying stream with next token (after proxy 429): {_secret_fingerprint(current_token)}")
                                     except HTTPException:
                                         # Only one token (or all tokens excluded). Keep the current token and retry
                                         # after backoff instead of failing fast.
@@ -4156,6 +4412,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     ]
                                 }
                                 debug_print(f"💾 Saved new session for conversation {conversation_id}")
+                                _bounded_session_put(api_key_str, conversation_id)
                             else:
                                 # Append new messages to history
                                 chat_sessions[api_key_str][conversation_id]["messages"].append(
@@ -4165,6 +4422,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     assistant_message
                                 )
                                 debug_print(f"💾 Updated existing session for conversation {conversation_id}")
+                                _bounded_session_put(api_key_str, conversation_id)
                             
                             yield "data: [DONE]\n\n"
                             debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
@@ -4355,13 +4613,13 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                 break # Critical error
                         
                         if response.status_code == HTTPStatus.UNAUTHORIZED:
-                            debug_print(f"🔒 Token {current_token[:20]}... expired in Chrome fetch (attempt {chrome_attempt+1})")
+                            debug_print(f"🔒 Token {_secret_fingerprint(current_token)} expired in Chrome fetch (attempt {chrome_attempt+1})")
                             failed_tokens.add(current_token)
                             # (Pruning disabled)
                             if chrome_attempt < max_chrome_retries - 1:
                                 try:
                                     current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                    debug_print(f"🔄 Rotating to next token: {current_token[:20]}...")
+                                    debug_print(f"🔄 Rotating to next token: {_secret_fingerprint(current_token)}")
                                     continue
                                 except HTTPException:
                                     break
@@ -4581,6 +4839,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     ]
                 }
                 debug_print(f"💾 Saved new session for conversation {conversation_id}")
+                _bounded_session_put(api_key_str, conversation_id)
             else:
                 # Append new messages to history
                 chat_sessions[api_key_str][conversation_id]["messages"].append(
@@ -4590,6 +4849,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                     assistant_message
                 )
                 debug_print(f"💾 Updated existing session for conversation {conversation_id}")
+                _bounded_session_put(api_key_str, conversation_id)
 
             # Build message object with reasoning and citations if present
             message_obj = {
@@ -4622,9 +4882,9 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             # No additional conversion needed
             
             # Calculate token counts (including reasoning tokens)
-            prompt_tokens = len(prompt)
-            completion_tokens = len(response_text)
-            reasoning_tokens = len(reasoning_text)
+            prompt_tokens = _estimate_tokens(prompt)
+            completion_tokens = _estimate_tokens(response_text)
+            reasoning_tokens = _estimate_tokens(reasoning_text)
             total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
             
             # Build usage object with reasoning tokens if present
@@ -4828,7 +5088,7 @@ async def anthropic_messages(request: AnthropicMessageRequest, raw_request: Requ
             buffer = ""
             
             # Send message_start
-            yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': request.model, 'stop_reason': None, 'usage': {'input_tokens': sum(len(str(m.get('content', ''))) for m in openai_messages), 'output_tokens': 0}}})}\n\n"
+            yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': request.model, 'stop_reason': None, 'usage': {'input_tokens': sum(_estimate_tokens(m.get('content', '')) for m in openai_messages), 'output_tokens': 0}}})}\n\n"
 
             # Send content_block_start
             yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -4874,7 +5134,7 @@ async def anthropic_messages(request: AnthropicMessageRequest, raw_request: Requ
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
 
             # Send message_delta
-            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': len(accumulated_text)}})}\n\n"
+            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': _estimate_tokens(accumulated_text)}})}\n\n"
 
             # Send message_stop
             yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
@@ -4917,7 +5177,7 @@ async def anthropic_messages(request: AnthropicMessageRequest, raw_request: Requ
                 "content": [{"type": "text", "text": full_text}],
                 "model": request.model,
                 "stop_reason": "end_turn",
-                "usage": {"input_tokens": 0, "output_tokens": len(full_text.split())}
+                "usage": {"input_tokens": sum(_estimate_tokens(m.get('content', '')) for m in openai_messages), "output_tokens": _estimate_tokens(full_text)}
             }
 
         if isinstance(result, dict) and "error" in result:
@@ -4936,7 +5196,7 @@ async def anthropic_messages(request: AnthropicMessageRequest, raw_request: Requ
             "content": [{"type": "text", "text": content}],
             "model": request.model,
             "stop_reason": "end_turn",
-            "usage": {"input_tokens": result.get("usage", {}).get("prompt_tokens", 0), "output_tokens": result.get("usage", {}).get("completion_tokens", len(content))}
+            "usage": {"input_tokens": result.get("usage", {}).get("prompt_tokens", 0), "output_tokens": result.get("usage", {}).get("completion_tokens", _estimate_tokens(content))}
         }
 
 

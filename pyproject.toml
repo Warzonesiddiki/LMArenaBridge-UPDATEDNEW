@@ -22,13 +22,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "fastapi>=0.100.0",
-    "uvicorn[standard]>=0.23.0",
-    "camoufox",
-    "playwright",
-    "httpx",
-    "cloudscraper",
-    "python-multipart",
+    "fastapi>=0.100.0,<1",
+    "uvicorn[standard]>=0.23.0,<1",
+    "camoufox>=0.5,<0.6",
+    "playwright>=1.40,<1.63",
+    "httpx>=0.24,<1",
+    "cloudscraper>=1.2.60,<2",
+    "python-multipart>=0.0.6,<1",
+    "requests>=2.31,<3",
 ]
 
 [project.optional-dependencies]
@@ -51,8 +52,11 @@ vision = [
     "vision-ai-recaptcha-solver>=1.0.5",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+# The repository's import package is literally named "src" and lives at the
+# repository root (src/__init__.py); package discovery must therefore start
+# at ".", not inside src/ (where there are modules, not subpackages).
+[tool.setuptools]
+packages = ["src"]
 
 [tool.black]
 line-length = 100
@@ -85,6 +89,8 @@ skip = [".git", ".venv", "venv", ".tox", "build", "dist"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
     "F",   # Pyflakes
@@ -114,7 +120,7 @@ exclude = [
     "oh-my-opencode",
 ]
 
-[tool.ruff.pydocstyle]
+[tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.mypy]

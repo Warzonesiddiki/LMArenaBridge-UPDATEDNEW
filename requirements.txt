@@ -1,8 +1,15 @@
-fastapi
-uvicorn
-camoufox
-playwright
-httpx
-cloudscraper
-python-multipart
-# vision-ai-recaptcha-solver  # optional: uncomment for AI-powered reCAPTCHA v2 image challenge solving (heavy dependencies: torch, ultralytics, onnxruntime)
+# Runtime dependencies — exact versions verified with the offline test suite
+# on Python 3.11 (2026-10-24). All require Python >= 3.10.
+# Camoufox 0.5.8 metadata requires playwright<1.63; do not float these.
+fastapi==0.162.0
+uvicorn==0.54.0
+camoufox==0.5.8
+playwright==1.62.0
+httpx==0.28.1
+cloudscraper==1.2.71
+python-multipart==0.0.32
+requests==2.34.2
+# Optional example client dependency (chat_interactive.py uses it; scripts/live_smoke.py uses httpx instead):
+# openai
+# Optional vision solver (not installed by default; heavy dependencies):
+# vision-ai-recaptcha-solver

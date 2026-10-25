@@ -879,6 +879,15 @@ def get_next_auth_token(exclude_tokens: set = None, *, allow_ephemeral_fallback:
             token = str(cookie_store.get("arena-auth-prod-v1") or "").strip()
             if token and not is_arena_auth_token_expired(token):
                 auth_tokens = [token]
+                # Match main.get_request_headers(): browser-session cookies may be
+                # used in memory, but are promoted to durable auth_tokens only
+                # when the operator explicitly enables persistence.
+                if bool(config.get("persist_arena_auth_cookie")):
+                    try:
+                        config["auth_tokens"] = [token]
+                        _m().save_config(config, preserve_auth_tokens=False)
+                    except Exception as exc:
+                        _m().debug_print(f"⚠️ Could not persist browser-session auth cookie: {exc}")
                 _m().debug_print("🔑 Using arena-auth cookie from browser session (browser_cookies).")
     if not auth_tokens:
         raise HTTPException(status_code=500, detail="No auth tokens configured")
@@ -932,7 +941,7 @@ def remove_auth_token(token: str, force: bool = False):
         prune_enabled = config.get("prune_invalid_tokens", False)
         
         if not prune_enabled and not force:
-            _m().debug_print(f"🔒 Token failed but pruning is disabled. Keep in config: {token[:20]}...")
+            _m().debug_print(f"🔒 Token failed but pruning is disabled. Keep in config: {_m()._secret_fingerprint(token)}")
             return
 
         auth_tokens = config.get("auth_tokens", [])
@@ -940,6 +949,6 @@ def remove_auth_token(token: str, force: bool = False):
             auth_tokens.remove(token)
             config["auth_tokens"] = auth_tokens
             _m().save_config(config, preserve_auth_tokens=False)
-            _m().debug_print(f"🗑️  Removed expired token from list: {token[:20]}...")
+            _m().debug_print(f"🗑️  Removed expired token from list: {_m()._secret_fingerprint(token)}")
     except Exception as e:
         _m().debug_print(f"⚠️  Error removing auth token: {e}")

@@ -23,6 +23,15 @@ class TestAuthTokenFallbackFromBrowserCookies(BaseBridgeTest):
         saved = json.loads(self._config_path.read_text(encoding="utf-8"))
         self.assertEqual(saved.get("auth_tokens"), ["cookie-token-1"])
 
+    def test_browser_cookie_not_persisted_when_persistence_disabled(self) -> None:
+        self.setup_config({"persist_arena_auth_cookie": False})
+
+        token = self.main.get_next_auth_token()
+
+        self.assertEqual(token, "cookie-token-1")
+        saved = json.loads(self._config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved.get("auth_tokens"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

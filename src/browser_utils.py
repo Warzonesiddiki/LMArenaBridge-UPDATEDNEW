@@ -387,6 +387,13 @@ async def _cancel_background_task(task: Optional["asyncio.Task"], *, timeout_sec
     task.cancel()
     try:
         await asyncio.wait_for(task, timeout=float(timeout_seconds))
+    except asyncio.CancelledError:
+        # Awaiting a task we just cancelled surfaces CancelledError in the
+        # caller. Swallow only that expected case; if the caller itself is
+        # being cancelled, preserve cooperative cancellation.
+        current = asyncio.current_task()
+        if current is not None and current.cancelling() > 0:
+            raise
     except Exception:
         pass
 

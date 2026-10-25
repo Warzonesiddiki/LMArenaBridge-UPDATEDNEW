@@ -1,14 +1,26 @@
 """
-Interactive chat script using OpenAI Python library with LMArena Bridge
-Allows you to have a conversation with any model available through the bridge
+Interactive chat script using OpenAI Python library with LMArena Bridge.
+Allows you to have a conversation with any model available through the bridge.
+
+Usage:
+    pip install openai
+    # bash/zsh:   export LMAB_API_KEY=<your bridge API key>
+    # PowerShell: $env:LMAB_API_KEY = "<your bridge API key>"
+    # Optional:    LMAB_BASE_URL=http://localhost:8000/api/v1
+    python chat_interactive.py
 """
 
-from openai import OpenAI
+import os
 import sys
 
-# Configuration
-BASE_URL = "http://localhost:8000/api/v1"
-API_KEY = "sk-lmab-50664b6f-87c7-4115-b630-eb38a9b55021"  # Replace with your API key
+try:
+    from openai import OpenAI
+except ImportError:  # reported with install instructions in main()
+    OpenAI = None  # type: ignore[assignment]
+
+# Configuration is read from the environment — never hard-code API keys.
+BASE_URL = os.environ.get("LMAB_BASE_URL", "http://localhost:8000/api/v1").rstrip("/")
+API_KEY = os.environ.get("LMAB_API_KEY", "").strip()
 
 def list_available_models(client):
     """List all available models"""
@@ -179,6 +191,16 @@ def main():
     print("🚀 LMArena Bridge - Interactive Chat")
     print("=" * 60)
     
+    if OpenAI is None:
+        print("❌ The 'openai' package is required. Install it with: pip install openai")
+        return
+    if not API_KEY:
+        print("❌ Set the LMAB_API_KEY environment variable to a bridge API key first.")
+        print("   Create one in the dashboard (http://localhost:8000/dashboard), then:")
+        print("   bash/zsh:   export LMAB_API_KEY=<your key>")
+        print("   PowerShell: $env:LMAB_API_KEY = '<your key>'")
+        return
+
     # Initialize OpenAI client
     try:
         client = OpenAI(

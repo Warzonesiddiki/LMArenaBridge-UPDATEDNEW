@@ -12,8 +12,10 @@ on main.X remain effective.
 import asyncio
 import json
 import os
+import random
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -29,6 +31,87 @@ def _m():
     """Late import of main module so tests can patch main.X and it is reflected here."""
     from . import main
     return main
+
+
+def _worker_backoff_seconds(consecutive_failures: int) -> float:
+    """Bounded exponential delay for Camoufox worker relaunch attempts."""
+    failures = max(0, int(consecutive_failures))
+    return min(5.0 * (2 ** failures), 300.0)
+
+
+@dataclass(frozen=True)
+class BrowserFetchTransportSpec:
+    """Static metadata shared by the Chrome and Camoufox fetch transports."""
+
+    name: str
+    label: str
+    emoji: str
+    timeout_config_key: str
+    default_outer_timeout: float
+
+
+BROWSER_FETCH_TRANSPORT_SPECS: dict[str, BrowserFetchTransportSpec] = {
+    "chrome": BrowserFetchTransportSpec(
+        name="chrome",
+        label="Chrome",
+        emoji="🌐",
+        timeout_config_key="chrome_fetch_outer_timeout_seconds",
+        default_outer_timeout=120.0,
+    ),
+    "camoufox": BrowserFetchTransportSpec(
+        name="camoufox",
+        label="Camoufox",
+        emoji="🦊",
+        timeout_config_key="camoufox_fetch_outer_timeout_seconds",
+        default_outer_timeout=180.0,
+    ),
+}
+
+
+def browser_fetch_order(*, prefer_chrome: bool = False) -> tuple[BrowserFetchTransportSpec, ...]:
+    """Return browser fetch transports in their sequential fallback order."""
+    names = ("chrome", "camoufox") if prefer_chrome else ("camoufox", "chrome")
+    return tuple(BROWSER_FETCH_TRANSPORT_SPECS[name] for name in names)
+
+
+def resolve_browser_fetch_outer_timeout(
+    config: Optional[dict], spec: BrowserFetchTransportSpec
+) -> float:
+    """Resolve a browser transport's outer timeout with the legacy bounds."""
+    try:
+        value = float((config or {}).get(spec.timeout_config_key, spec.default_outer_timeout))
+    except Exception:
+        value = float(spec.default_outer_timeout)
+    return max(20.0, min(value, 300.0))
+
+
+def select_browser_fetch_auth_token(current_token: object, ephemeral_token: object) -> str:
+    """Choose the auth token to pass to a browser fetch transport.
+
+    This preserves the previous streaming behavior: an ephemeral browser
+    token replaces the current token only when it looks valid/unexpired and
+    the current token is absent, implausible, or expired. If token inspection
+    itself fails, the ephemeral candidate is used as before.
+    """
+    auth_for_browser = str(current_token or "").strip()
+    candidate = str(ephemeral_token or "").strip()
+    if not candidate:
+        return auth_for_browser
+    try:
+        main = _m()
+        if (
+            main.is_probably_valid_arena_auth_token(candidate)
+            and not main.is_arena_auth_token_expired(candidate, skew_seconds=0)
+            and (
+                not auth_for_browser
+                or not main.is_probably_valid_arena_auth_token(auth_for_browser)
+                or main.is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
+            )
+        ):
+            return candidate
+    except Exception:
+        return candidate
+    return auth_for_browser
 
 
 class BrowserFetchStreamResponse:
@@ -978,12 +1061,13 @@ async def fetch_lmarena_stream_via_chrome(
                             if isinstance(item, str) and item.startswith('{"__type":"meta"'):
                                 meta = json.loads(item)
                             else:
-                                # Put it back and use default meta
+                                # Preserve the item; status remains unknown until the
+                                # buffered fetch result below can be inspected.
                                 await lines_queue.put(item)
-                                meta = {"status": 200, "headers": {}}
                         except asyncio.QueueEmpty:
-                            # No items in queue, use default successful response
-                            meta = {"status": 200, "headers": {}}
+                            # Do not fabricate a successful upstream status. The
+                            # buffered fetch result below determines success/failure.
+                            pass
                         
                         if meta:
                             result = meta
@@ -1650,12 +1734,13 @@ async def fetch_lmarena_stream_via_camoufox(
                             if isinstance(item, str) and item.startswith('{"__type":"meta"'):
                                 meta = json.loads(item)
                             else:
-                                # Put it back and use default meta
+                                # Preserve the item; status remains unknown until the
+                                # buffered fetch result below can be inspected.
                                 await lines_queue.put(item)
-                                meta = {"status": 200, "headers": {}}
                         except asyncio.QueueEmpty:
-                            # No items in queue, use default successful response
-                            meta = {"status": 200, "headers": {}}
+                            # Do not fabricate a successful upstream status. The
+                            # buffered fetch result below determines success/failure.
+                            pass
                         
                         if meta:
                             result = meta
@@ -1679,6 +1764,16 @@ async def fetch_lmarena_stream_via_camoufox(
 
                 if not _is_recaptcha_validation_failed(status_code, result.get("text")):
                     if status_code < 400:
+                        buffered_text = result.get("text") if isinstance(result, dict) else None
+                        if isinstance(buffered_text, str) and buffered_text:
+                            return BrowserFetchStreamResponse(
+                                status_code=status_code,
+                                headers=result.get("headers", {}),
+                                text=buffered_text,
+                                method=http_method,
+                                url=url,
+                            )
+
                         def _on_fetch_task_done(task: "asyncio.Task") -> None:
                             _m()._consume_background_task_exception(task)
                             try:
@@ -1784,10 +1879,10 @@ async def fetch_via_proxy_queue(
 
     task_id = str(uuid.uuid4())
     future = asyncio.Future()
-    proxy_pending_tasks[task_id] = future
+    _m().proxy_pending_tasks[task_id] = future
 
     # Add to queue
-    proxy_task_queue.append({
+    _m().proxy_task_queue.append({
         "id": task_id,
         "url": url,
         "method": http_method,
@@ -1854,11 +1949,11 @@ async def fetch_via_proxy_queue(
             
     except asyncio.TimeoutError:
         _m().debug_print(f"❌ Proxy Task {task_id} timed out. Is the Userscript running?")
-        if task_id in proxy_pending_tasks:
-            del proxy_pending_tasks[task_id]
-        if task_id in [t['id'] for t in proxy_task_queue]:
+        if task_id in _m().proxy_pending_tasks:
+            del _m().proxy_pending_tasks[task_id]
+        if task_id in [t['id'] for t in _m().proxy_task_queue]:
             # Remove from queue if not picked up
-            proxy_task_queue[:] = [t for t in proxy_task_queue if t['id'] != task_id]
+            _m().proxy_task_queue[:] = [t for t in _m().proxy_task_queue if t['id'] != task_id]
         return None
     except Exception as e:
         _m().debug_print(f"❌ Proxy Task Exception: {e}")
@@ -1968,6 +2063,7 @@ async def camoufox_proxy_worker():
     last_signup_attempt_at: float = 0.0
     
     queue = _get_userscript_proxy_queue()
+    consecutive_worker_failures = 0
 
     while True:
         try:
@@ -2252,6 +2348,9 @@ async def camoufox_proxy_worker():
                         _m().debug_print("🦊 Camoufox proxy: initial cookies saved to config.")
                 except Exception:
                     pass
+
+                # Launch + initial navigation completed; future failures start a fresh backoff cycle.
+                consecutive_worker_failures = 0
 
             async def _get_auth_cookie_value() -> str:
                 nonlocal context, page
@@ -3005,8 +3104,13 @@ async def camoufox_proxy_worker():
                     pass
             return
         except Exception as e:
-            _m().debug_print(f"⚠️ Camoufox proxy worker exception: {e}")
-            await asyncio.sleep(5.0)
+            retry_delay = _worker_backoff_seconds(consecutive_worker_failures) + random.uniform(0, 2.0)
+            consecutive_worker_failures += 1
+            _m().debug_print(
+                f"⚠️ Camoufox proxy worker exception: {e}. "
+                f"Retrying in {retry_delay:.1f}s (failure {consecutive_worker_failures})."
+            )
+            await asyncio.sleep(retry_delay)
             # Mark for relaunch
             browser = None
             page = None
